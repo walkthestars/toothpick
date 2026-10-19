@@ -28,9 +28,6 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install Ruff
-        run: uv tool install ruff
-
       - name: Sync dependencies (locked)
         run: uv sync --locked --dev
 

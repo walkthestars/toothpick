@@ -62,6 +62,10 @@ build-backend = "uv_build"
 dev = [
     "coverage>=7.6.0",
     "pytest>=9.1.1",
+    # Pinned: ruff's default rule set grows between releases and this project
+    # carries no [tool.ruff] selection, so an unpinned ruff turns a green tree
+    # red on release (0.17.x flags ~2.5k findings the codebase never opted in to).
+    "ruff==0.15.22",
 ]
 
 [tool.pytest.ini_options]
