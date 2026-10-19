@@ -37,6 +37,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 __all__ = [
@@ -911,7 +912,11 @@ class MinidumpReader:
                 path = self.read_string(name_rva)
             except CdbError:
                 path = ""
-            name = Path(path).name if path else f"module_{index}"
+            # Minidump image paths are Windows paths by definition (MDMP is a
+            # Windows format). `Path` splits on the host's separator, so on
+            # POSIX it returns the whole `C:\\Games\\game.exe` string instead
+            # of the basename; `PureWindowsPath` splits the same everywhere.
+            name = PureWindowsPath(path).name if path else f"module_{index}"
             modules.append(
                 CdbModule(
                     name=name,
