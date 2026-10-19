@@ -1,0 +1,767 @@
+"""
+Tests for UNIT-J3 (Chunk 1): ``toothpick.lua_mod`` Lua mod scaffolding,
+Workshop-style packaging and the class-file patch descriptor.
+
+This is the battery the drive's declared verify gate runs
+(``uv run pytest tests/test_lua_mod.py -p no:faulthandler``): the Chunk-1
+subset of the plan's Chunk 2b battery (the CLI ``lua`` group tests stay in the
+Chunk 2a drive).
+
+Validates:
+1. ``LuaModConfig`` strict construction (identifier/version/JVM class/method/
+   descriptor grammar, single-line fields, ``.``/``..`` path-escape refusal)
+   and its JSON-plain views.
+2. The ``[A-Za-z0-9_.-]+`` identifier helper and the ``()V``-shaped JVM method
+   descriptor helper, accept and refuse paths included.
+3. ``generate_lua_mod`` layout (``media/lua/client/<mod_id>/main.lua`` +
+   ``mod.info`` + ``README.md``), boot-token print, hook stub and mod.info
+   fields.
+4. ``grounded=False`` stamping ``UNVERIFIED (allows-unverified)`` into
+   ``main.lua`` and ``README.md`` and reporting it in the metadata, with no
+   grounding claim anywhere.
+5. Determinism (byte-identical regeneration, config-derived boot token, no
+   clock/dir input) and Trap 7 handle hygiene (regenerate + remove the tree).
+6. ``package_workshop`` zip + ``<mod_id>.workshop.json`` manifest with
+   per-file ``path``/``size``/``sha256`` and a manifest-level digest over the
+   canonical file list; deterministic zip bytes; idempotent in-place packing.
+7. Patch-descriptor schema validation and round-trip equality
+   (``emit_patch_descriptor`` -> ``parse_patch_descriptor`` ==
+   ``validate_patches``), plus every documented refusal.
+8. Purity: stdlib-only imports, no network/process/clock modules, no
+   ``faulthandler`` import or hooks (Trap 11), LF-only UTF-8 output (Trap 7).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+import re
+import shutil
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from toothpick import lua_mod
+from toothpick.lua_mod import (
+    DESCRIPTOR_SCHEMA,
+    DESCRIPTOR_SCHEMA_VERSION,
+    GROUNDING_STATUS_GROUNDED,
+    GROUNDING_STATUS_UNVERIFIED,
+    PATCH_KEYS,
+    PATCH_OPS,
+    LuaModConfig,
+    LuaModError,
+    emit_patch_descriptor,
+    generate_lua_mod,
+    is_valid_identifier,
+    is_valid_method_descriptor,
+    package_workshop,
+    parse_patch_descriptor,
+    validate_patches,
+)
+
+MOD_ID = "toothpick_testmod"
+MOD_NAME = "Toothpick Test Mod"
+TARGET_CLASS = "zombie/characters/IsoPlayer"
+TARGET_METHOD = "update"
+TARGET_DESC = "()V"
+
+#: Canonical emitted POSIX order of the generated project (README first).
+GENERATED_ORDER = ["README.md", f"media/lua/client/{MOD_ID}/main.lua", "mod.info"]
+
+#: Three descriptor entries covering the whole ``op`` vocabulary.
+PATCHES = [
+    {
+        "class": TARGET_CLASS,
+        "method": TARGET_METHOD,
+        "desc": TARGET_DESC,
+        "op": "replace",
+        "lua_hook": "ToothpickLuaMod.onHook",
+    },
+    {
+        "class": TARGET_CLASS,
+        "method": "<init>",
+        "desc": "(Ljava/lang/String;)V",
+        "op": "append",
+        "lua_hook": "ToothpickLuaMod.onGameStart",
+    },
+    {
+        "class": "zombie.characters.IsoGameCharacter",
+        "method": "tick",
+        "desc": "(IZ)V",
+        "op": "prepend",
+        "lua_hook": "ToothpickLuaMod.onHook",
+    },
+]
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+
+def _config(**overrides: object) -> LuaModConfig:
+    base: dict[str, object] = {
+        "name": MOD_NAME,
+        "mod_id": MOD_ID,
+        "version": "1.0.0",
+        "target_class": TARGET_CLASS,
+        "target_method": TARGET_METHOD,
+        "target_desc": TARGET_DESC,
+        "author": "walkthestars",
+    }
+    base.update(overrides)
+    return LuaModConfig(**base)  # type: ignore[arg-type]
+
+
+def _generate(
+    tmp_path: Path, grounded: bool = True, **overrides: object
+) -> tuple[dict, Path]:
+    out_dir = tmp_path / "mods" / MOD_ID
+    return generate_lua_mod(_config(**overrides), out_dir, grounded=grounded), out_dir
+
+
+def _tree(project: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(project).as_posix(): path.read_bytes()
+        for path in sorted(project.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _main_lua_path(project: Path) -> Path:
+    return project / "media" / "lua" / "client" / MOD_ID / "main.lua"
+
+
+# --------------------------------------------------------------------------- #
+# 1-2. LuaModConfig -- validation grammar and stable views
+# --------------------------------------------------------------------------- #
+
+
+def test_config_exposes_stable_json_plain_views() -> None:
+    config = _config()
+
+    assert config.target_symbol == f"{TARGET_CLASS}.{TARGET_METHOD}:{TARGET_DESC}"
+    assert config.main_lua_relative == f"media/lua/client/{MOD_ID}/main.lua"
+    assert config.description == (
+        f"{MOD_NAME} v1.0.0 -- target {config.target_symbol} "
+        "(generated by Toothpick)"
+    )
+    assert config.to_dict() == {
+        "name": MOD_NAME,
+        "mod_id": MOD_ID,
+        "version": "1.0.0",
+        "target_class": TARGET_CLASS,
+        "target_method": TARGET_METHOD,
+        "target_desc": TARGET_DESC,
+        "target_symbol": config.target_symbol,
+        "author": "walkthestars",
+    }
+    assert json.loads(json.dumps(config.to_dict())) == config.to_dict()
+
+
+def test_config_author_defaults_to_empty() -> None:
+    config = LuaModConfig(
+        name=MOD_NAME,
+        mod_id=MOD_ID,
+        version="0.1",
+        target_class="com.foo.Bar",
+        target_method="<init>",
+        target_desc="()V",
+    )
+    assert config.author == ""
+    # The whole accepted grammar in one place: dotted class, <init>, semver-ish.
+    assert config.target_symbol == "com.foo.Bar.<init>:()V"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "needle"),
+    [
+        ("name", "", "non-empty"),
+        ("name", 7, "must be a str"),
+        ("name", "two\nlines", "single line"),
+        ("name", "carriage\rreturn", "single line"),
+        ("mod_id", "../evil", "'..'"),
+        ("mod_id", "a..b", "'..'"),
+        ("mod_id", ".", "'..'"),
+        ("mod_id", "bad id", "[A-Za-z0-9_.-]+"),
+        ("mod_id", "sub/dir", "[A-Za-z0-9_.-]+"),
+        ("mod_id", 7, "must be a str"),
+        ("version", "v1.0", "semver"),
+        ("version", "", "non-empty"),
+        ("version", "1.0.0.0.0", "semver"),
+        ("target_class", "com/foo/Bar;", "JVM binary class name"),
+        ("target_class", "com..foo", "JVM binary class name"),
+        ("target_class", "com/foo/Bar\n", "single line"),
+        ("target_method", "1tick", "JVM method name"),
+        ("target_method", "tick()", "JVM method name"),
+        ("target_desc", "(V)V", "method descriptor"),
+        ("target_desc", "(I)", "method descriptor"),
+        ("target_desc", "()", "method descriptor"),
+        ("target_desc", "()V ", "method descriptor"),
+        ("target_desc", "()v", "method descriptor"),
+        ("author", 3, "must be a str"),
+    ],
+)
+def test_config_refuses_bad_inputs(field: str, value: object, needle: str) -> None:
+    with pytest.raises(LuaModError) as excinfo:
+        _config(**{field: value})
+    assert needle in str(excinfo.value)
+
+
+def test_identifier_helper_refuses_path_escapes() -> None:
+    for good in ("my_mod-1.0", "my.mod", "toothpick_testmod", "MOD_ID_9"):
+        assert is_valid_identifier(good) is True
+    for bad in ("", ".", "..", "../evil", "..\\evil", "a/b", "bad id", 7, None):
+        assert is_valid_identifier(bad) is False
+
+
+def test_method_descriptor_helper_accepts_the_jvm_grammar() -> None:
+    for good in (
+        "()V",
+        "(I)V",
+        "(IZLjava/lang/String;)V",
+        "([B)V",
+        "(II)[Ljava/lang/Object;",
+        "()Z",
+        "()Ljava/lang/String;",
+    ):
+        assert is_valid_method_descriptor(good) is True
+    for bad in ("", "V", "()", "(I)", "()VV", "(V)V", "()v", "()V ", " ()V", 7, None):
+        assert is_valid_method_descriptor(bad) is False
+
+
+# --------------------------------------------------------------------------- #
+# 3. generate_lua_mod -- layout, content, mod.info fields
+# --------------------------------------------------------------------------- #
+
+
+def test_generate_lua_mod_emits_the_expected_layout(tmp_path: Path) -> None:
+    result, project = _generate(tmp_path)
+
+    assert result["status"] == "success"
+    assert result["mod_id"] == MOD_ID
+    assert result["name"] == MOD_NAME
+    assert result["version"] == "1.0.0"
+    assert result["grounded"] is True
+    assert result["grounding_status"] == GROUNDING_STATUS_GROUNDED
+    assert result["target"] == f"{TARGET_CLASS}.{TARGET_METHOD}:{TARGET_DESC}"
+    assert re.fullmatch(r"[0-9a-f]{32}", result["boot_token"])
+    assert result["project_dir"] == str(project)
+    assert result["main_lua"] == str(_main_lua_path(project))
+    assert result["files"] == sorted(
+        str(project / relative) for relative in GENERATED_ORDER
+    )
+    assert sorted(_tree(project)) == sorted(GENERATED_ORDER)
+
+
+def test_generate_lua_mod_main_lua_carries_the_boot_token_and_hook_stub(
+    tmp_path: Path,
+) -> None:
+    result, project = _generate(tmp_path)
+    text = _main_lua_path(project).read_text(encoding="utf-8")
+
+    # The receipt-checking harness greps for this exact line.
+    assert lua_mod.BOOT_TOKEN_PREFIX in text
+    assert f'print("{lua_mod.BOOT_TOKEN_PREFIX}" .. BOOT_TOKEN)' in text
+    assert result["boot_token"] in text
+    assert f'local BOOT_TOKEN = "{result["boot_token"]}"' in text
+
+    # The hook stub names the JVM target as Class.method:desc and does nothing else.
+    assert result["target"] in text
+    assert "function ToothpickLuaMod.onHook()" in text
+    assert "ToothpickLuaMod.onGameStart" in text
+    assert "Events.OnGameStart.Add(ToothpickLuaMod.onGameStart)" in text
+    assert "return ToothpickLuaMod" in text
+    assert GROUNDING_STATUS_UNVERIFIED not in text
+    assert "UNVERIFIED" not in text
+
+
+def test_generate_lua_mod_mod_info_fields(tmp_path: Path) -> None:
+    _, project = _generate(tmp_path)
+    lines = [
+        line
+        for line in (project / "mod.info").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert lines[0] == f"name={MOD_NAME}"
+    assert f"id={MOD_ID}" in lines
+    assert "version=1.0.0" in lines
+    descriptions = [line for line in lines if line.startswith("description=")]
+    assert len(descriptions) == 1
+    assert descriptions[0].partition("=")[2] == (
+        f"{MOD_NAME} v1.0.0 -- target {TARGET_CLASS}.{TARGET_METHOD}:{TARGET_DESC} "
+        "(generated by Toothpick)"
+    )
+
+
+def test_generate_lua_mod_readme_documents_install_workshop_and_patch(
+    tmp_path: Path,
+) -> None:
+    result, project = _generate(tmp_path)
+    readme = (project / "README.md").read_text(encoding="utf-8")
+
+    assert f"# {MOD_NAME} (`{MOD_ID}`) v1.0.0" in readme
+    assert lua_mod.BOOT_TOKEN_PREFIX in readme
+    assert result["boot_token"] in readme
+    assert "## Install (Project Zomboid)" in readme
+    assert "## Workshop upload (Steam)" in readme
+    assert f"media/lua/client/{MOD_ID}/main.lua" in readme
+    assert "toothpick lua pack . --out dist/" in readme
+    assert "## Describing a class-file edit (patch descriptor)" in readme
+    for op in sorted(PATCH_OPS):
+        assert f"`{op}`" in readme
+    assert "UNVERIFIED (allows-unverified)" not in readme
+
+
+def test_generate_lua_mod_returns_json_plain_metadata(tmp_path: Path) -> None:
+    result, _ = _generate(tmp_path)
+
+    assert json.loads(json.dumps(result)) == result
+    assert set(result) == {
+        "status",
+        "project_dir",
+        "files",
+        "mod_id",
+        "name",
+        "version",
+        "grounded",
+        "grounding_status",
+        "boot_token",
+        "target",
+        "main_lua",
+    }
+    for value in result.values():
+        assert isinstance(value, (str, bool, list))
+
+
+# --------------------------------------------------------------------------- #
+# 4. receipts-or-refusal -- the UNVERIFIED banner
+# --------------------------------------------------------------------------- #
+
+
+def test_generate_lua_mod_marks_unverified_without_claiming_grounding(
+    tmp_path: Path,
+) -> None:
+    result, project = _generate(tmp_path, grounded=False)
+
+    assert result["grounded"] is False
+    assert result["grounding_status"] == GROUNDING_STATUS_UNVERIFIED
+
+    text = _main_lua_path(project).read_text(encoding="utf-8")
+    readme = (project / "README.md").read_text(encoding="utf-8")
+
+    # Loud banner in the Lua file and the README, and the status in the metadata.
+    assert f'local GROUNDING_STATUS = "{GROUNDING_STATUS_UNVERIFIED}"' in text
+    assert f"-- Grounding status: {GROUNDING_STATUS_UNVERIFIED}" in text
+    assert "-- UNVERIFIED (allows-unverified): no confirmed GROUNDED receipt backs" in text
+    assert f"**{GROUNDING_STATUS_UNVERIFIED}**" in readme
+    assert f"`{GROUNDING_STATUS_UNVERIFIED}`" in readme
+    assert result["grounding_status"] in readme
+    assert result["boot_token"] in text
+
+    # grounded=True is the only run that may say GROUNDED, and it carries no banner.
+    grounded_result, grounded_project = _generate(tmp_path / "grounded")
+    grounded_text = _main_lua_path(grounded_project).read_text(encoding="utf-8")
+    assert grounded_result["grounding_status"] == GROUNDING_STATUS_GROUNDED
+    assert f'local GROUNDING_STATUS = "{GROUNDING_STATUS_GROUNDED}"' in grounded_text
+    assert "UNVERIFIED" not in grounded_text
+    assert GROUNDING_STATUS_UNVERIFIED not in (
+        grounded_project / "README.md"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("bad", [1, 0, "yes", None, 1.0])
+def test_generate_lua_mod_refuses_a_truthy_non_bool_grounding(
+    tmp_path: Path, bad: object
+) -> None:
+    with pytest.raises(LuaModError, match="grounded must be a bool"):
+        generate_lua_mod(_config(), tmp_path / "out", grounded=bad)  # type: ignore[arg-type]
+
+
+def test_generate_lua_mod_refuses_bad_inputs(tmp_path: Path) -> None:
+    with pytest.raises(LuaModError, match="must be a LuaModConfig"):
+        generate_lua_mod({"mod_id": MOD_ID}, tmp_path / "out")  # type: ignore[arg-type]
+
+    not_a_dir = tmp_path / "mod.info"
+    not_a_dir.write_text("id=x\n", encoding="utf-8")
+    with pytest.raises(LuaModError, match="not a directory"):
+        generate_lua_mod(_config(), not_a_dir)
+
+
+# --------------------------------------------------------------------------- #
+# 5. determinism + Trap 7 handle hygiene
+# --------------------------------------------------------------------------- #
+
+
+def test_generate_lua_mod_is_deterministic_and_leaves_no_locked_handles(
+    tmp_path: Path,
+) -> None:
+    first, first_dir = _generate(tmp_path)
+    first_bytes = _tree(first_dir)
+
+    # Regenerating over the same tree must work (no dangling handles, Trap 7).
+    second, second_dir = _generate(tmp_path)
+    assert _tree(second_dir) == first_bytes
+    assert second["boot_token"] == first["boot_token"]
+    assert second["files"] == first["files"]
+
+    # A different output directory must not change a single byte (no dir input).
+    third = generate_lua_mod(_config(), tmp_path / "elsewhere")
+    assert _tree(tmp_path / "elsewhere") == first_bytes
+    assert third["boot_token"] == first["boot_token"]
+
+    # The grounding flag is part of the canonical payload, so it moves the token.
+    ungrounded, ungrounded_dir = _generate(tmp_path, grounded=False)
+    assert ungrounded["boot_token"] != first["boot_token"]
+    assert _tree(ungrounded_dir) != first_bytes
+
+    # Py3.8+ on Windows raises PermissionError here if a handle leaked.
+    shutil.rmtree(tmp_path / "mods")
+
+
+def test_generated_files_are_lf_only_utf8_text(tmp_path: Path) -> None:
+    _, project = _generate(tmp_path)
+
+    for path in sorted(p for p in project.rglob("*") if p.is_file()):
+        data = path.read_bytes()
+        assert b"\r\n" not in data, path
+        assert data.endswith(b"\n"), path
+        data.decode("utf-8")  # decodes cleanly
+        if path.name == "mod.info":
+            data.decode("ascii")  # the Zomboid metadata file stays ASCII
+
+
+# --------------------------------------------------------------------------- #
+# 6. package_workshop -- zip + manifest
+# --------------------------------------------------------------------------- #
+
+
+def test_package_workshop_writes_zip_and_manifest_with_sha256(tmp_path: Path) -> None:
+    _, project = _generate(tmp_path)
+    out_dir = tmp_path / "dist"
+
+    result = package_workshop(project, out_dir)
+
+    assert result["status"] == "success"
+    zip_path = Path(result["zip_path"])
+    manifest_path = Path(result["manifest_path"])
+    assert zip_path == out_dir / f"{MOD_ID}.zip"
+    assert manifest_path == out_dir / f"{MOD_ID}.workshop.json"
+    assert zip_path.is_file() and manifest_path.is_file()
+
+    manifest = result["manifest"]
+    assert manifest["mod_id"] == MOD_ID
+    assert manifest["version"] == "1.0.0"
+    assert [entry["path"] for entry in manifest["files"]] == GENERATED_ORDER
+    for entry in manifest["files"]:
+        data = (project / entry["path"]).read_bytes()
+        assert entry["size"] == len(data)
+        assert entry["sha256"] == hashlib.sha256(data).hexdigest()
+
+    # The manifest-level digest covers the canonical file list, recomputable.
+    canonical = json.dumps(
+        {"mod_id": MOD_ID, "version": "1.0.0", "files": manifest["files"]},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    assert manifest["sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    assert json.loads(json.dumps(result)) == result
+    assert result["zip_sha256"] == hashlib.sha256(zip_path.read_bytes()).hexdigest()
+
+    with zipfile.ZipFile(zip_path) as archive:
+        assert archive.namelist() == GENERATED_ORDER
+        for info in archive.infolist():
+            assert info.date_time == (1980, 1, 1, 0, 0, 0)
+        for relative in GENERATED_ORDER:
+            assert archive.read(relative) == (project / relative).read_bytes()
+
+
+def test_package_workshop_is_byte_deterministic_and_idempotent(tmp_path: Path) -> None:
+    _, project = _generate(tmp_path)
+
+    first = package_workshop(project, tmp_path / "dist_a")
+    second = package_workshop(project, tmp_path / "dist_a")
+    assert first["zip_sha256"] == second["zip_sha256"]
+    assert Path(first["zip_path"]).read_bytes() == Path(second["zip_path"]).read_bytes()
+    assert first["manifest"] == second["manifest"]
+
+    # Packing into the project directory must not fold the package into itself.
+    in_place = package_workshop(project, project)
+    assert [entry["path"] for entry in in_place["manifest"]["files"]] == GENERATED_ORDER
+    assert in_place["manifest"] == first["manifest"]
+    assert in_place["zip_sha256"] == first["zip_sha256"]
+    assert _tree(project) == {**{k: _tree(project)[k] for k in GENERATED_ORDER},
+                              f"{MOD_ID}.zip": Path(in_place["zip_path"]).read_bytes(),
+                              f"{MOD_ID}.workshop.json": Path(
+                                  in_place["manifest_path"]
+                              ).read_bytes()}
+
+
+def test_package_workshop_defaults_out_path_to_the_project_parent(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "fallbackmod"
+    project.mkdir()
+    (project / "notes.txt").write_text("hello\n", encoding="utf-8")
+
+    result = package_workshop(project)
+
+    # No mod.info: the id falls back to the folder name, version stays empty.
+    assert result["manifest"]["mod_id"] == "fallbackmod"
+    assert result["manifest"]["version"] == ""
+    assert Path(result["zip_path"]) == tmp_path / "fallbackmod.zip"
+    assert [entry["path"] for entry in result["manifest"]["files"]] == ["notes.txt"]
+
+
+def test_package_workshop_refuses_bad_projects(tmp_path: Path) -> None:
+    with pytest.raises(LuaModError, match="not an existing directory"):
+        package_workshop(tmp_path / "missing", tmp_path / "dist")
+
+    a_file = tmp_path / "not_a_project"
+    a_file.write_text("x", encoding="utf-8")
+    with pytest.raises(LuaModError, match="not a directory"):
+        package_workshop(a_file, tmp_path / "dist")
+
+
+def test_package_workshop_refuses_a_mod_info_path_escape(tmp_path: Path) -> None:
+    project = tmp_path / "evil"
+    project.mkdir()
+    (project / "mod.info").write_text("id=../evil\nversion=1.0.0\n", encoding="utf-8")
+
+    with pytest.raises(LuaModError, match=r"'\.\.'"):
+        package_workshop(project, tmp_path / "dist")
+
+
+# --------------------------------------------------------------------------- #
+# 7. patch descriptor -- emit / parse / schema refusals / round trip
+# --------------------------------------------------------------------------- #
+
+
+def test_emit_and_parse_patch_descriptor_round_trip(tmp_path: Path) -> None:
+    out = tmp_path / "patches" / "patch.json"
+
+    result = emit_patch_descriptor(PATCHES, out)
+
+    assert result["status"] == "success"
+    assert result["count"] == len(PATCHES)
+    assert result["schema"] == DESCRIPTOR_SCHEMA
+    assert result["schema_version"] == DESCRIPTOR_SCHEMA_VERSION
+    assert result["out_path"] == str(out)
+    assert Path(result["out_path"]).is_file()
+
+    expected = [{key: patch[key] for key in PATCH_KEYS} for patch in PATCHES]
+    assert result["patches"] == expected
+    parsed = parse_patch_descriptor(out)
+    assert parsed == expected
+    assert parsed == validate_patches(PATCHES)
+    assert parsed is not PATCHES
+    assert all(list(entry) == list(PATCH_KEYS) for entry in parsed)
+    assert json.loads(json.dumps(parsed)) == parsed
+
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["schema"] == DESCRIPTOR_SCHEMA
+    assert document["schema_version"] == DESCRIPTOR_SCHEMA_VERSION
+    assert document["patch_count"] == len(PATCHES)
+    assert document["patches"] == expected
+    assert "never rewrites class files" in document["note"]
+
+    canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    assert result["sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    # Re-emitting what was parsed is byte-identical: the round trip is stable.
+    again = emit_patch_descriptor(parsed, tmp_path / "patches" / "patch2.json")
+    assert (tmp_path / "patches" / "patch2.json").read_bytes() == out.read_bytes()
+    assert again["sha256"] == result["sha256"]
+
+
+def test_parse_patch_descriptor_accepts_a_minimal_document(tmp_path: Path) -> None:
+    path = tmp_path / "minimal.json"
+    path.write_text(json.dumps({"patches": [dict(PATCHES[0])]}), encoding="utf-8")
+
+    assert parse_patch_descriptor(path) == validate_patches([PATCHES[0]])
+
+
+def test_validate_patches_returns_fresh_json_plain_dicts() -> None:
+    original = [dict(PATCHES[0])]
+
+    validated = validate_patches(original)
+
+    assert validated == original
+    assert validated is not original
+    assert validated[0] is not original[0]
+    validated[0]["op"] = "append"
+    assert original[0]["op"] == "replace"
+
+
+@pytest.mark.parametrize(
+    ("patch", "needle"),
+    [
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": "insert", "lua_hook": "h"},
+         "op must be one of"),
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": 7, "lua_hook": "h"},
+         "op must be one of"),
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": "replace", "lua_hook": ""},
+         "lua_hook must be a non-empty string"),
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": "replace", "lua_hook": 3},
+         "lua_hook must be a non-empty string"),
+        ({"class": "a/B", "method": "m", "desc": "()Q", "op": "replace", "lua_hook": "h"},
+         "method descriptor"),
+        ({"class": "1bad", "method": "m", "desc": "()V", "op": "replace", "lua_hook": "h"},
+         "JVM binary class name"),
+        ({"class": "a/B", "method": "1bad", "desc": "()V", "op": "replace", "lua_hook": "h"},
+         "JVM method name"),
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": "replace"},
+         "missing required key"),
+        ({"class": "a/B", "method": "m", "desc": "()V", "op": "replace", "lua_hook": "h",
+          "extra": 1}, "unknown key"),
+    ],
+)
+def test_validate_patches_refuses_schema_violations(
+    patch: dict, needle: str
+) -> None:
+    with pytest.raises(LuaModError) as excinfo:
+        validate_patches([patch])
+    assert needle in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", [{}, {"class": "a/B"}, "not-a-list", b"[]", 7, None])
+def test_validate_patches_refuses_non_lists(bad: object) -> None:
+    with pytest.raises(LuaModError, match="must be a list of patch objects"):
+        validate_patches(bad)
+
+
+def test_validate_patches_refuses_empty_and_malformed_entries() -> None:
+    with pytest.raises(LuaModError, match="at least one patch"):
+        validate_patches([])
+    with pytest.raises(LuaModError, match="must be an object"):
+        validate_patches(["nope"])
+    with pytest.raises(LuaModError, match="non-string key"):
+        validate_patches([{1: "x"}])  # type: ignore[dict-item]
+
+
+def test_emit_patch_descriptor_writes_nothing_when_the_schema_fails(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "patch.json"
+    with pytest.raises(LuaModError, match="missing required key"):
+        emit_patch_descriptor([{"class": "a/B"}], out)
+    assert not out.exists()
+
+    a_dir = tmp_path / "descriptors"
+    a_dir.mkdir()
+    with pytest.raises(LuaModError, match="not a directory"):
+        emit_patch_descriptor(PATCHES, a_dir)
+
+
+def test_parse_patch_descriptor_refuses_bad_documents(tmp_path: Path) -> None:
+    with pytest.raises(LuaModError, match="not found"):
+        parse_patch_descriptor(tmp_path / "absent.json")
+
+    a_dir = tmp_path / "a_dir"
+    a_dir.mkdir()
+    with pytest.raises(LuaModError, match="is a directory"):
+        parse_patch_descriptor(a_dir)
+
+    cases = [
+        ("broken.json", "{not json", "not valid JSON"),
+        ("list.json", json.dumps([]), "root must be a JSON object"),
+        (
+            "document.json",
+            json.dumps([{"class": "a/B", "method": "m", "desc": "()V", "op": "replace",
+                         "lua_hook": "h"}]),
+            "root must be a JSON object",
+        ),
+        (
+            "foreign.json",
+            json.dumps({"schema": "other.tool", "patches": PATCHES}),
+            "declares schema",
+        ),
+        (
+            "nopatches.json",
+            json.dumps({"schema": DESCRIPTOR_SCHEMA}),
+            "missing the required 'patches' key",
+        ),
+        (
+            "mismatch.json",
+            json.dumps(
+                {"schema": DESCRIPTOR_SCHEMA, "patch_count": 5, "patches": PATCHES}
+            ),
+            "declares patch_count",
+        ),
+        (
+            "badcount.json",
+            json.dumps({"patches": PATCHES, "patch_count": "3"}),
+            "must be an integer",
+        ),
+        (
+            "notlist.json",
+            json.dumps({"patches": {"class": "a/B"}, "patch_count": 1}),
+            "must be a list",
+        ),
+        (
+            "badentry.json",
+            json.dumps({"patches": [{"class": "a/B", "method": "m", "desc": "()V",
+                                     "op": "insert", "lua_hook": "h"}]}),
+            "op must be one of",
+        ),
+    ]
+    for name, body, needle in cases:
+        path = tmp_path / name
+        path.write_text(body, encoding="utf-8")
+        with pytest.raises(LuaModError) as excinfo:
+            parse_patch_descriptor(path)
+        assert needle in str(excinfo.value), name
+
+
+# --------------------------------------------------------------------------- #
+# 8. purity -- stdlib only, no network/process/clock, no faulthandler hooks
+# --------------------------------------------------------------------------- #
+
+
+def test_module_does_not_import_or_install_faulthandler() -> None:
+    """Native-engine suites run under ``-p no:faulthandler``: no hooks installed."""
+    source = inspect.getsource(lua_mod)
+
+    assert "import faulthandler" not in source
+    assert "faulthandler.enable" not in source
+    assert "faulthandler.register" not in source
+
+
+def test_module_is_offline_deterministic_and_stdlib_only() -> None:
+    source = inspect.getsource(lua_mod)
+
+    for module in ("socket", "subprocess", "urllib", "http", "requests", "random",
+                   "datetime", "time"):
+        assert not re.search(
+            rf"^\s*(?:import|from)\s+{module}\b", source, re.MULTILINE
+        ), module
+    imported = set(re.findall(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_]*)", source, re.MULTILINE))
+    assert imported == {"hashlib", "json", "re", "zipfile"}
+
+
+def test_module_declares_the_chunk1_public_api() -> None:
+    for name in (
+        "LuaModError",
+        "LuaModConfig",
+        "PATCH_OPS",
+        "PATCH_KEYS",
+        "DESCRIPTOR_SCHEMA",
+        "DESCRIPTOR_SCHEMA_VERSION",
+        "is_valid_identifier",
+        "is_valid_method_descriptor",
+        "validate_patches",
+        "generate_lua_mod",
+        "package_workshop",
+        "emit_patch_descriptor",
+        "parse_patch_descriptor",
+    ):
+        assert name in lua_mod.__all__
+        assert hasattr(lua_mod, name)
+    assert PATCH_OPS == frozenset({"prepend", "append", "replace"})
+    assert PATCH_KEYS == ("class", "method", "desc", "op", "lua_hook")

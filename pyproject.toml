@@ -1,0 +1,68 @@
+[project]
+name = "toothpick"
+version = "0.1.0"
+description = "Deterministic multi-architecture binary reverse-engineering engine, MCP server, and singleplayer game modding toolbox"
+readme = "README.md"
+license = "AGPL-3.0-only"
+authors = [
+    { name = "walkthestars", email = "64265241+walkthestars@users.noreply.github.com" }
+]
+keywords = [
+    "reverse-engineering",
+    "mcp",
+    "disassembly",
+    "game-modding",
+    "smt-solver",
+    "frida",
+    "capstone",
+    "unicorn",
+    "z3",
+    "bepinex",
+    "harmony",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Security",
+    "Topic :: Software Development :: Disassemblers",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "capstone>=5.0.9",
+    "click>=8.5.0",
+    "frida>=17.23.3",
+    "lief>=1.0.0",
+    "lz4>=4.4.5",
+    "mcp>=2.3.0",
+    "pyelftools>=0.33",
+    "pyghidra>=3.1.0",
+    "unicorn>=2.1.4",
+    "z3-solver>=5.1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/walkthestars/toothpick"
+Repository = "https://github.com/walkthestars/toothpick"
+Issues = "https://github.com/walkthestars/toothpick/issues"
+
+[project.scripts]
+toothpick = "toothpick.cli:cli"
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.6.0",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-p no:faulthandler"

@@ -1,0 +1,85 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+jobs:
+  check:
+    name: Check sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          if [ -z "$BASE_SHA" ] \
+             || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "No usable base commit ($BASE_SHA); checking $HEAD_SHA alone."
+            RANGE="$HEAD_SHA -n 1"
+          else
+            RANGE="$BASE_SHA..$HEAD_SHA"
+          fi
+
+          for sha in $(git rev-list --reverse $RANGE); do
+            if [ "$(git rev-list --no-walk --count --merges "$sha")" -eq 1 ]; then
+              continue
+            fi
+
+            author="$(git show -s --format='%an <%ae>' "$sha")"
+            subject="$(git show -s --format='%s' "$sha")"
+            trailers="$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")"
+
+            matched=0
+            while IFS= read -r trailer; do
+              trailer="${trailer#"${trailer%%[![:space:]]*}"}"
+              trailer="${trailer%"${trailer##*[![:space:]]}"}"
+              [ -n "$trailer" ] || continue
+              if [ "${trailer,,}" = "${author,,}" ]; then
+                matched=1
+                break
+              fi
+            done <<<"$trailers"
+
+            if [ "$matched" -eq 1 ]; then
+              echo "ok    ${sha:0:8}  $subject"
+            else
+              echo "FAIL  ${sha:0:8}  $subject"
+              echo "        author:    $author"
+              echo "        sign-offs: ${trailers:-(none)}"
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            cat <<'EOF'
+
+          ---
+          One or more commits are missing a `Signed-off-by` trailer matching
+          their author, or the trailer doesn't match the commit author exactly.
+
+          Fix the most recent commit:
+              git commit --amend -s --no-edit
+
+          Fix every commit on the branch:
+              git rebase --signoff master
+
+          Then force-push. See CONTRIBUTING.md ("Sign Your Work") and the DCO file.
+          ---
+          EOF
+            exit 1
+          fi
+
+          echo "All commits signed off."
